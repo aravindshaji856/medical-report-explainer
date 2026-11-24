@@ -9,6 +9,7 @@ from groq import Groq
 from PIL import Image
 
 from range_checker import resolve_statuses
+from safety import clean_info
 
 load_dotenv()
 
@@ -16,12 +17,14 @@ client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 VISION_MODEL = os.getenv("GROQ_VISION_MODEL", "qwen/qwen3.8-27b")
 TEXT_MODEL = os.getenv("GROQ_TEXT_MODEL", "openai/gpt-oss-120b")
 
-EXTRACT_PROMPT = """You read a photo of a lab report or prescription and extract the data. Do not explain anything.
+EXTRACT_PROMPT = """You read a photo of a lab report or a prescription (printed or handwritten) and extract the data. Do not explain anything.
 
 Rules:
-- Copy values exactly as printed, including any H or L letter. If unreadable, use null. Never guess.
+- Copy values exactly as printed or written, including any H or L letter. Never guess.
+- If any part is hard to read, write "UNCLEAR" for that part. A wrong medicine name is dangerous, so prefer "UNCLEAR" over a guess.
 - Read each row left to right, one row at a time. Name, value, unit and range must all come from the SAME row.
 - If a row has no printed range, use null for lo and hi. Never reuse another row's range or unit.
+- Do NOT extract patient name, ID, age or doctor name.
 - If the image is not a lab report or prescription, use report_type "unknown".
 - Output ONE line of compact JSON. No line breaks, no markdown.
 
@@ -36,6 +39,7 @@ STRICT RULES:
 - NEVER recommend, change, start or stop any treatment, medicine or dose.
 - NEVER say what a result means for the patient's health or what might be causing it. Only describe what a test measures, or what a medicine is generally used for, in general terms.
 - Use short, simple words.
+- If an item contains UNCLEAR, do not explain it. Use the text "Could not be read clearly".
 - Questions for the doctor must be neutral, such as "Can you explain my X result?" or "Should this test be repeated?". Never suggest a cause or a condition.
 
 You get a list of items from the patient's document, each with a status in brackets. Return ONLY valid JSON:
@@ -45,7 +49,6 @@ You get a list of items from the patient's document, each with a status in brack
 
 
 def prepare_image(image: Image.Image, max_side: int = 2000) -> str:
-    """Shrink the image and return it as a base64 data URL."""
     image = image.convert("RGB")
     image.thumbnail((max_side, max_side))
     buffer = io.BytesIO()
@@ -124,11 +127,14 @@ def extract_data(image: Image.Image) -> dict:
         {"name": r.get("n"), "dosage": r.get("d"), "frequency": r.get("f"), "duration": r.get("t")}
         for r in (raw.get("medicines") or []) if isinstance(r, dict) and r.get("n")
     ]
-    return {"report_type": raw.get("report_type", "unknown"), "tests": tests, "medicines": medicines}
+    report_type = raw.get("report_type", "unknown")
+    if not tests and not medicines:
+        report_type = "unknown"
+    return {"report_type": report_type, "tests": tests, "medicines": medicines}
 
 
 def explain_data(data: dict) -> dict:
-    """Step 2: the text model writes the plain-language parts."""
+    """Step 2: the text model writes the plain-language parts. Uses the patient-confirmed data."""
     lines = []
     tests = data.get("tests") or []
     for t, res in zip(tests, resolve_statuses(tests)):
@@ -146,28 +152,10 @@ def explain_data(data: dict) -> dict:
         max_tokens=3000,
     )
     response = chat(kwargs, "low")
-    return extract_json(response.choices[0].message.content)
-
-
-def analyze_report(image: Image.Image) -> dict:
-    data = extract_data(image)
-    if data.get("report_type") == "unknown" or not (data["tests"] or data["medicines"]):
-        data["report_type"] = "unknown"
-        return data
-
-    info = explain_data(data)
-    explanations = info.get("explanations") or {}
-
-    for t in data["tests"]:
-        t["what_it_measures"] = explanations.get(t.get("name"), "")
-    for m in data["medicines"]:
-        m["what_it_is_for_simple"] = explanations.get(m.get("name"), "")
-
-    data["summary"] = info.get("summary", "")
-    data["questions_for_doctor"] = info.get("questions_for_doctor", [])
-    return data
+    return clean_info(extract_json(response.choices[0].message.content))
 
 
 if __name__ == "__main__":
     img = Image.open("sample_report.jpg")
-    print(json.dumps(analyze_report(img), indent=2))
+    d = extract_data(img)
+    print(json.dumps(explain_data(d), indent=2))
