@@ -72,13 +72,16 @@ def df_to_tests(df, original):
     for idx, r in df.iterrows():
         if not back(r["Test"]):
             continue
-        value = back(r["Value"])
-        # If the patient changed an existing value, drop the old printed H/L letter
-        if isinstance(idx, int) and idx < len(original) and value is not None:
-            if value != str(original[idx]["value"]):
-                value = re.sub(r"\s*[HLhl]\s*$", "", value)
+        value, lo, hi = back(r["Value"]), back(r["Normal min"]), back(r["Normal max"])
+        edited = True  # rows added by the patient count as edited
+        if isinstance(idx, int) and idx < len(original):
+            o = original[idx]
+            edited = (value != back(s(o["value"])) or lo != back(s(o["report_min"]))
+                      or hi != back(s(o["report_max"])))
+        if edited and value:
+            value = re.sub(r"\s*[HLhl]\s*$", "", value)  # drop the old printed flag
         out.append({"name": back(r["Test"]), "value": value, "unit": back(r["Unit"]),
-                    "report_min": back(r["Normal min"]), "report_max": back(r["Normal max"])})
+                    "report_min": lo, "report_max": hi, "edited": edited})
     return out
 
 
@@ -117,7 +120,7 @@ if not file:
     st.stop()
 
 # Reset everything when a new file is chosen
-file_key = f"{getattr(file, 'name', 'camera')}-{file.size}"
+file_key = str(getattr(file, "file_id", None) or f"{getattr(file, 'name', 'camera')}-{file.size}")
 if st.session_state.get("file_key") != file_key:
     reset_state()
     st.session_state["file_key"] = file_key
@@ -155,11 +158,11 @@ with right:
     if data["tests"]:
         st.markdown("**Test results**")
         edited_tests = st.data_editor(tests_to_df(data["tests"]), num_rows="dynamic",
-                                      use_container_width=True, hide_index=True, key="tests_editor")
+                                      use_container_width=True, hide_index=True, key=f"tests_editor_{file_key}")
     if data["medicines"]:
         st.markdown("**Medicines**")
         edited_meds = st.data_editor(meds_to_df(data["medicines"]), num_rows="dynamic",
-                                     use_container_width=True, hide_index=True, key="meds_editor")
+                                     use_container_width=True, hide_index=True, key=f"meds_editor_{file_key}")
 
 if st.button("✅ Confirm and explain", type="primary"):
     confirmed = {

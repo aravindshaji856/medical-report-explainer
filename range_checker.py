@@ -90,7 +90,7 @@ def resolve_statuses(tests):
         flag = printed_flag(t.get("value"))
         if flag:
             res["status"], res["source"] = flag, "flag printed on report"
-        elif uses_flags and res["status"] in ("low", "high"):
+        elif uses_flags and not t.get("edited") and res["status"] in ("low", "high"):
             res["status"], res["source"] = "unknown", "range may be misread, please verify"
         out.append(res)
     return out
