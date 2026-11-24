@@ -8,42 +8,43 @@ from dotenv import load_dotenv
 from groq import Groq
 from PIL import Image
 
+from range_checker import resolve_statuses
+
 load_dotenv()
 
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-MODEL = os.getenv("GROQ_VISION_MODEL", "qwen/qwen3.6-27b")
+VISION_MODEL = os.getenv("GROQ_VISION_MODEL", "qwen/qwen3.8-27b")
+TEXT_MODEL = os.getenv("GROQ_TEXT_MODEL", "openai/gpt-oss-120b")
 
-SYSTEM_PROMPT = """You are a medical report explainer for patients. You read a photo of a lab report or a prescription and explain it in simple language.
+EXTRACT_PROMPT = """You read a photo of a lab report or prescription and extract the data. Do not explain anything.
+
+Rules:
+- Copy values exactly as printed, including any H or L letter. If unreadable, use null. Never guess.
+- Read each row left to right, one row at a time. Name, value, unit and range must all come from the SAME row.
+- If a row has no printed range, use null for lo and hi. Never reuse another row's range or unit.
+- If the image is not a lab report or prescription, use report_type "unknown".
+- Output ONE line of compact JSON. No line breaks, no markdown.
+
+Format:
+{"report_type":"lab_report","tests":[{"n":"NAME","v":"value","u":"unit","lo":null,"hi":null}],"medicines":[{"n":"NAME","d":"dosage","f":"frequency","t":"duration"}]}
+For lab reports leave "medicines" empty. For prescriptions leave "tests" empty."""
+
+EXPLAIN_PROMPT = """You explain medical report contents to patients in very simple words.
 
 STRICT RULES:
 - NEVER diagnose any disease or condition.
 - NEVER recommend, change, start or stop any treatment, medicine or dose.
-- NEVER say what the results "mean" for the patient's health. Only describe what each test measures in general terms.
-- Use short, simple words a non-medical person understands.
-- Copy values exactly as printed. If something is unreadable, use null. Never guess.
-- If the image is not a lab report or prescription, set report_type to "unknown".
+- NEVER say what a result means for the patient's health or what might be causing it. Only describe what a test measures, or what a medicine is generally used for, in general terms.
+- Use short, simple words.
+- Questions for the doctor must be neutral, such as "Can you explain my X result?" or "Should this test be repeated?". Never suggest a cause or a condition.
 
-Return ONLY valid JSON in this format:
-{
-  "report_type": "lab_report" | "prescription" | "unknown",
-  "tests": [
-    {"name": "", "value": "", "unit": "", "report_min": null, "report_max": null, "what_it_measures": ""}
-  ],
-  "medicines": [
-    {"name": "", "dosage": "", "frequency": "", "duration": "", "what_it_is_for_simple": ""}
-  ],
-  "summary": "2-4 sentence plain-language overview of what this document contains",
-  "questions_for_doctor": ["", "", ""]
-}
-
-Notes:
-- For lab reports, fill "tests" and leave "medicines" empty. For prescriptions, do the opposite.
-- report_min / report_max are the reference range printed on the report, as numbers. Use null if not printed.
-- Do NOT decide whether a value is high or low. Our code does that.
-- Give 5-8 useful questions the patient can ask their doctor."""
+You get a list of items from the patient's document, each with a status in brackets. Return ONLY valid JSON:
+{"summary":"2-3 sentence plain overview of what the document contains",
+ "explanations":{"<item name exactly as given>":"one short sentence of what it measures or what the medicine is generally used for"},
+ "questions_for_doctor":["5 to 8 neutral questions the patient can ask their doctor, mentioning specific out-of-range items when there are any"]}"""
 
 
-def prepare_image(image: Image.Image, max_side: int = 1600) -> str:
+def prepare_image(image: Image.Image, max_side: int = 2000) -> str:
     """Shrink the image and return it as a base64 data URL."""
     image = image.convert("RGB")
     image.thumbnail((max_side, max_side))
@@ -53,39 +54,120 @@ def prepare_image(image: Image.Image, max_side: int = 1600) -> str:
     return f"data:image/jpeg;base64,{encoded}"
 
 
-def extract_json(text: str) -> dict:
-    """Pull the JSON object out of the model's reply, even if it has extra text."""
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+def clean_text(text: str) -> str:
+    text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.DOTALL)
     text = text.replace("```json", "").replace("```", "").strip()
-    start, end = text.find("{"), text.rfind("}")
-    if start == -1 or end == -1:
+    start = text.find("{")
+    return text[start:] if start != -1 else text
+
+
+def extract_json(text: str) -> dict:
+    text = clean_text(text)
+    end = text.rfind("}")
+    if end == -1:
         raise ValueError("No JSON found in model response")
-    return json.loads(text[start:end + 1])
+    return json.loads(text[:end + 1])
 
 
-def analyze_report(image: Image.Image) -> dict:
-    """Send the image to Groq and return the parsed JSON."""
-    data_url = prepare_image(image)
+def repair_json(text: str) -> dict:
+    """Parse JSON; if the output was cut off, keep the complete rows."""
+    text = clean_text(text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    closers = ["", "]", "}", "]}", "}]", "}]}", "]}]}", "}],\"medicines\":[]}", "]}],\"medicines\":[]}"]
+    for cut in range(len(text) - 1, 0, -1):
+        if text[cut] not in "}]":
+            continue
+        for closing in closers:
+            try:
+                return json.loads(text[:cut + 1] + closing)
+            except json.JSONDecodeError:
+                continue
+    raise ValueError("Could not read the model's response")
 
-    response = client.chat.completions.create(
-        model=MODEL,
+
+def chat(kwargs, reasoning_effort):
+    """Call Groq with a reasoning setting; retry without it if the model rejects it."""
+    try:
+        return client.chat.completions.create(reasoning_effort=reasoning_effort, **kwargs)
+    except Exception as e:
+        if "reasoning" not in str(e).lower():
+            raise
+        return client.chat.completions.create(**kwargs)
+
+
+def extract_data(image: Image.Image) -> dict:
+    """Step 1: the vision model reads the image (short output)."""
+    kwargs = dict(
+        model=VISION_MODEL,
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "Read this document and return the JSON."},
-                    {"type": "image_url", "image_url": {"url": data_url}},
-                ],
-            },
+            {"role": "system", "content": EXTRACT_PROMPT},
+            {"role": "user", "content": [
+                {"type": "text", "text": "Extract the data and return the JSON."},
+                {"type": "image_url", "image_url": {"url": prepare_image(image)}},
+            ]},
         ],
-        temperature=0.2,
-        max_tokens=2500,
+        temperature=0.1,
+        max_tokens=950,
     )
+    response = chat(kwargs, "none")
+    raw = repair_json(response.choices[0].message.content)
+
+    tests = [
+        {"name": r.get("n"), "value": r.get("v"), "unit": r.get("u"),
+         "report_min": r.get("lo"), "report_max": r.get("hi")}
+        for r in (raw.get("tests") or []) if isinstance(r, dict) and r.get("n")
+    ]
+    medicines = [
+        {"name": r.get("n"), "dosage": r.get("d"), "frequency": r.get("f"), "duration": r.get("t")}
+        for r in (raw.get("medicines") or []) if isinstance(r, dict) and r.get("n")
+    ]
+    return {"report_type": raw.get("report_type", "unknown"), "tests": tests, "medicines": medicines}
+
+
+def explain_data(data: dict) -> dict:
+    """Step 2: the text model writes the plain-language parts."""
+    lines = []
+    tests = data.get("tests") or []
+    for t, res in zip(tests, resolve_statuses(tests)):
+        lines.append(f"{t.get('name')}: {t.get('value')} {t.get('unit') or ''} [{res['status']}]")
+    for m in data.get("medicines") or []:
+        lines.append(f"{m.get('name')}: {m.get('dosage')} {m.get('frequency')} {m.get('duration')}")
+
+    kwargs = dict(
+        model=TEXT_MODEL,
+        messages=[
+            {"role": "system", "content": EXPLAIN_PROMPT},
+            {"role": "user", "content": f"Document type: {data.get('report_type')}\nItems:\n" + "\n".join(lines)},
+        ],
+        temperature=0.3,
+        max_tokens=3000,
+    )
+    response = chat(kwargs, "low")
     return extract_json(response.choices[0].message.content)
 
 
+def analyze_report(image: Image.Image) -> dict:
+    data = extract_data(image)
+    if data.get("report_type") == "unknown" or not (data["tests"] or data["medicines"]):
+        data["report_type"] = "unknown"
+        return data
+
+    info = explain_data(data)
+    explanations = info.get("explanations") or {}
+
+    for t in data["tests"]:
+        t["what_it_measures"] = explanations.get(t.get("name"), "")
+    for m in data["medicines"]:
+        m["what_it_is_for_simple"] = explanations.get(m.get("name"), "")
+
+    data["summary"] = info.get("summary", "")
+    data["questions_for_doctor"] = info.get("questions_for_doctor", [])
+    return data
+
+
 if __name__ == "__main__":
-    # Quick test: put a sample report photo in the folder and set its name here
     img = Image.open("sample_report.jpg")
     print(json.dumps(analyze_report(img), indent=2))

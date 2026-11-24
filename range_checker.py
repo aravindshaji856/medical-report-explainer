@@ -7,7 +7,6 @@ RANGES_PATH = Path(__file__).parent / "ranges.json"
 with open(RANGES_PATH, "r", encoding="utf-8") as f:
     RANGES = json.load(f)
 
-
 ALIAS_MAP = {}
 for main_name, info in RANGES.items():
     ALIAS_MAP[main_name.lower()] = main_name
@@ -16,19 +15,17 @@ for main_name, info in RANGES.items():
 
 
 def normalize_name(name: str) -> str:
-    """Lowercase and strip extra characters so names match more easily."""
-    name = name.lower().strip()
+    name = str(name).lower().strip()
     name = re.sub(r"[^a-z0-9 ]", " ", name)
     return re.sub(r"\s+", " ", name).strip()
 
 
 def find_test(name: str):
-    """Return the main test name from ranges.json, or None if unknown."""
     return ALIAS_MAP.get(normalize_name(name))
 
 
 def to_number(value):
-    """Convert '12.5', '12.5 g/dL' or '1,50,000' to a float. Returns None if it fails."""
+    """Convert '12.5', '134L', '<200' or '1,50,000' to a float. None if it fails."""
     if value is None:
         return None
     if isinstance(value, (int, float)):
@@ -36,15 +33,14 @@ def to_number(value):
     match = re.search(r"-?\d[\d,]*\.?\d*", str(value))
     if not match:
         return None
-    return float(match.group().replace(",", ""))
+    try:
+        return float(match.group().replace(",", ""))
+    except ValueError:
+        return None
 
 
 def check_value(name, value, report_min=None, report_max=None):
-    """
-    Decide if a value is low / normal / high.
-    Uses the range printed on the report first, then falls back to ranges.json.
-    Returns a dict: {status, min, max, source}
-    """
+    """Returns {status, min, max, source}. Uses the report's range first, then ranges.json."""
     num = to_number(value)
     low = to_number(report_min)
     high = to_number(report_max)
@@ -71,8 +67,38 @@ def check_value(name, value, report_min=None, report_max=None):
     return {"status": status, "min": low, "max": high, "source": source}
 
 
+def printed_flag(value):
+    """Reads an H or L printed after the value, like '151H' or '3.0L'."""
+    match = re.search(r"([HL])\s*$", str(value).strip(), re.IGNORECASE)
+    if not match:
+        return None
+    return "high" if match.group(1).upper() == "H" else "low"
+
+
+def resolve_statuses(tests):
+    """
+    Final status for every test, in the same order as `tests`.
+    1. The H/L flag printed on the report wins (most reliable).
+    2. Otherwise our own range check is used.
+    3. If the report prints flags but our check says abnormal with no printed flag,
+       the range was probably misread, so we mark it 'unknown' instead of guessing.
+    """
+    uses_flags = any(printed_flag(t.get("value")) for t in tests)
+    out = []
+    for t in tests:
+        res = check_value(t.get("name", ""), t.get("value"), t.get("report_min"), t.get("report_max"))
+        flag = printed_flag(t.get("value"))
+        if flag:
+            res["status"], res["source"] = flag, "flag printed on report"
+        elif uses_flags and res["status"] in ("low", "high"):
+            res["status"], res["source"] = "unknown", "range may be misread, please verify"
+        out.append(res)
+    return out
+
+
 if __name__ == "__main__":
-    print(check_value("Hb", "10.2"))                     # low, from reference file
-    print(check_value("SGPT", 80))                       # high
-    print(check_value("Glucose", 90, 70, 110))           # normal, from report
-    print(check_value("Some Rare Test", 5))              # unknown
+    print(check_value("Hb", "10.2"))
+    print(check_value("SGPT", 80))
+    print(check_value("Glucose", 90, 70, 110))
+    print(check_value("Some Rare Test", 5))
+    print(printed_flag("151H"), printed_flag("3.0L"), printed_flag("102"))
