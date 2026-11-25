@@ -108,13 +108,7 @@ st.title("🩺 Medical Report Explainer")
 st.caption("Upload a lab report or prescription (photo or PDF) and get a simple explanation.")
 st.warning(DISCLAIMER)
 
-tab_upload, tab_camera = st.tabs(["📁 Upload photo / PDF", "📷 Use camera"])
-with tab_upload:
-    uploaded = st.file_uploader("Choose a file", type=["jpg", "jpeg", "png", "webp", "pdf"])
-with tab_camera:
-    camera = st.camera_input("Take a photo of the document")
-
-file = uploaded or camera
+file = st.file_uploader("Upload a photo or PDF", type=["jpg", "jpeg", "png", "webp", "pdf"])
 
 if not file:
     st.stop()
