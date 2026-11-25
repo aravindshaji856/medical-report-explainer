@@ -67,10 +67,6 @@ streamlit run app.py
 - Reference ranges are general adult values, and the report's own range is always used first
 - Free API tier has rate limits
 
-## Team
-- Sai Naga Yuktesh : UI
-- Aravind Shaji: LLM integration and prompts
-- D Abhishek Reddy: Range logic and testing
-- Gokul Divakar: Safety, README and demo
+
 
 > ⚠️ Not medical advice. For information only. Always consult a doctor.
